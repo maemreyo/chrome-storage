@@ -1,0 +1,2120 @@
+// src/react/hooks.ts
+// React hooks for Chrome Storage
+
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { AdvancedStorage } from '../core/advanced-storage';
+import { StorageManager } from '../core/storage-manager';
+import {
+  StorageChange,
+  SetOptions,
+  QueryOptions,
+  StorageStats,
+  Session,
+  HistoryItem,
+  Settings,
+  StorageError,
+  SyncStatus
+} from '../core/types';
+
+// Get default storage instance
+const getDefaultStorage = (): AdvancedStorage => {
+  return StorageManager.getInstance().getDefault();
+};
+
+/**
+ * Hook for basic storage operations
+ */
+export function useStorage<T = any>(
+  key: string,
+  defaultValue?: T,
+  options?: {
+    storage?: AdvancedStorage;
+    syncToStorage?: boolean;
+  }
+): [T | undefined, (value: T | ((prev: T | undefined) => T)) => Promise<void>, boolean, Error | null] {
+  const storage = options?.storage || getDefaultStorage();
+  const [value, setValue] = useState<T | undefined>(undefined);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const isMounted = useRef(true);
+  
+  // Load initial value
+  useEffect(() => {
+    let cancelled = false;
+    
+    const loadValue = async () => {
+      try {
+        setLoading(true);
+        const stored = await storage.get<T>(key);
+        
+        if (!cancelled && isMounted.current) {
+          setValue(stored !== null ? stored : defaultValue);
+          setError(null);
+        }
+      } catch (err) {
+        if (!cancelled && isMounted.current) {
+          setError(err as Error);
+          setValue(defaultValue);
+        }
+      } finally {
+        if (!cancelled && isMounted.current) {
+          setLoading(false);
+        }
+      }
+    };
+    
+    loadValue();
+    
+    return () => {
+      cancelled = true;
+    };
+  }, [key, storage]);
+  
+  // Subscribe to changes
+  useEffect(() => {
+    const unsubscribe = storage.watch(key, (change: StorageChange) => {
+      if (isMounted.current) {
+        setValue(change.newValue as T);
+      }
+    });
+    
+    return unsubscribe;
+  }, [key, storage]);
+  
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
+  
+  // Update function
+  const updateValue = useCallback(async (newValue: T | ((prev: T | undefined) => T)) => {
+    try {
+      const actualValue = typeof newValue === 'function'
+        ? (newValue as (prev: T | undefined) => T)(value)
+        : newValue;
+      
+      if (options?.syncToStorage !== false) {
+        await storage.set(key, actualValue);
+      }
+      
+      setValue(actualValue);
+      setError(null);
+    } catch (err) {
+      setError(err as Error);
+      throw err;
+    }
+  }, [key, storage, value, options?.syncToStorage]);
+  
+  return [value, updateValue, loading, error];
+}
+
+/**
+ * Hook with automatic state synchronization
+ */
+export function useStorageState<T = any>(
+  key: string,
+  initialValue?: T,
+  options?: SetOptions & { storage?: AdvancedStorage }
+): {
+  value: T | undefined;
+  setValue: (value: T) => Promise<void>;
+  loading: boolean;
+  error: Error | null;
+  remove: () => Promise<void>;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [value, setValue, loading, error] = useStorage<T>(key, initialValue, { storage });
+  
+  const remove = useCallback(async () => {
+    try {
+      await storage.delete(key);
+      setValue(undefined as any);
+    } catch (err) {
+      throw err;
+    }
+  }, [key, storage, setValue]);
+  
+  const setValueWithOptions = useCallback(async (newValue: T) => {
+    const { storage: _, ...setOptions } = options || {};
+    await storage.set(key, newValue, setOptions);
+    setValue(newValue);
+  }, [key, storage, setValue, options]);
+  
+  return {
+    value,
+    setValue: setValueWithOptions,
+    loading,
+    error,
+    remove
+  };
+}
+
+/**
+ * Hook for querying storage
+ */
+export function useStorageQuery<T = any>(
+  queryOptions: QueryOptions,
+  options?: {
+    storage?: AdvancedStorage;
+    refreshInterval?: number;
+    enabled?: boolean;
+  }
+): {
+  data: T[];
+  loading: boolean;
+  error: Error | null;
+  refetch: () => Promise<void>;
+  isRefetching: boolean;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [data, setData] = useState<T[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<Error | null>(null);
+  const [isRefetching, setIsRefetching] = useState(false);
+  const enabled = options?.enabled !== false;
+  
+  const executeQuery = useCallback(async (isRefetch = false) => {
+    if (!enabled) return;
+    
+    try {
+      if (isRefetch) {
+        setIsRefetching(true);
+      } else {
+        setLoading(true);
+      }
+      
+      const results = await storage.query<T>(queryOptions);
+      setData(results);
+      setError(null);
+    } catch (err) {
+      setError(err as Error);
+    } finally {
+      setLoading(false);
+      setIsRefetching(false);
+    }
+  }, [storage, queryOptions, enabled]);
+  
+  // Initial query
+  useEffect(() => {
+    executeQuery();
+  }, [executeQuery]);
+  
+  // Refresh interval
+  useEffect(() => {
+    if (!options?.refreshInterval || !enabled) return;
+    
+    const interval = setInterval(() => {
+      executeQuery(true);
+    }, options.refreshInterval);
+    
+    return () => clearInterval(interval);
+  }, [options?.refreshInterval, executeQuery, enabled]);
+  
+  const refetch = useCallback(() => executeQuery(true), [executeQuery]);
+  
+  return { data, loading, error, refetch, isRefetching };
+}
+
+/**
+ * Hook for storage synchronization
+ */
+export function useStorageSync(options?: {
+  storage?: AdvancedStorage;
+  onSync?: (result: any) => void;
+  onError?: (error: Error) => void;
+}): {
+  status: SyncStatus;
+  sync: () => Promise<void>;
+  isSyncing: boolean;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [status, setStatus] = useState<SyncStatus>({
+    lastSync: null,
+    nextSync: null,
+    inProgress: false,
+    conflicts: 0,
+    pendingChanges: 0,
+    errors: []
+  });
+  const [isSyncing, setIsSyncing] = useState(false);
+  
+  // Update status periodically
+  useEffect(() => {
+    const updateStatus = () => {
+      const syncManager = (storage as any).sync;
+      if (syncManager) {
+        setStatus(syncManager.getStatus());
+      }
+    };
+    
+    updateStatus();
+    const interval = setInterval(updateStatus, 1000);
+    
+    return () => clearInterval(interval);
+  }, [storage]);
+  
+  const sync = useCallback(async () => {
+    try {
+      setIsSyncing(true);
+      const syncManager = (storage as any).sync;
+      
+      if (syncManager) {
+        await syncManager.syncNow();
+        options?.onSync?.(true);
+      }
+    } catch (error) {
+      options?.onError?.(error as Error);
+      throw error;
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [storage, options]);
+  
+  return { status, sync, isSyncing };
+}
+
+/**
+ * Hook for storage statistics
+ */
+export function useStorageStats(
+  options?: {
+    storage?: AdvancedStorage;
+    refreshInterval?: number;
+  }
+): {
+  stats: StorageStats | null;
+  loading: boolean;
+  refresh: () => Promise<void>;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [stats, setStats] = useState<StorageStats | null>(null);
+  const [loading, setLoading] = useState(true);
+  
+  const loadStats = useCallback(async () => {
+    try {
+      setLoading(true);
+      const currentStats = await storage.getStats();
+      setStats(currentStats);
+    } catch (error) {
+      console.error('Failed to load storage stats:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [storage]);
+  
+  useEffect(() => {
+    loadStats();
+    
+    if (options?.refreshInterval) {
+      const interval = setInterval(loadStats, options.refreshInterval);
+      return () => clearInterval(interval);
+    }
+  }, [loadStats, options?.refreshInterval]);
+  
+  return { stats, loading, refresh: loadStats };
+}
+
+/**
+ * Hook for session management
+ */
+export function useSession(options?: {
+  storage?: AdvancedStorage;
+  autoStart?: boolean;
+}): {
+  session: Session | null;
+  isActive: boolean;
+  startSession: (userId?: string, data?: any) => Promise<Session>;
+  endSession: (reason?: string) => Promise<void>;
+  updateSession: (data: any) => Promise<void>;
+  trackActivity: (type: string, details?: any) => void;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [session, setSession] = useState<Session | null>(null);
+  const [isActive, setIsActive] = useState(false);
+  
+  // Session manager methods would be implemented here
+  // This is a simplified version
+  
+  const startSession = useCallback(async (userId?: string, data?: any): Promise<Session> => {
+    const newSession: Session = {
+      id: `session_${Date.now()}`,
+      userId,
+      startedAt: new Date(),
+      lastActiveAt: new Date(),
+      data: data || {},
+      activities: []
+    };
+    
+    await storage.set('__current_session__', newSession);
+    setSession(newSession);
+    setIsActive(true);
+    
+    return newSession;
+  }, [storage]);
+  
+  const endSession = useCallback(async (reason?: string) => {
+    if (session) {
+      await storage.set(`__session_archive_${session.id}`, {
+        ...session,
+        endedAt: new Date(),
+        endReason: reason
+      });
+      await storage.delete('__current_session__');
+    }
+    
+    setSession(null);
+    setIsActive(false);
+  }, [storage, session]);
+  
+  const updateSession = useCallback(async (data: any) => {
+    if (!session) throw new Error('No active session');
+    
+    const updated = {
+      ...session,
+      data: { ...session.data, ...data },
+      lastActiveAt: new Date()
+    };
+    
+    await storage.set('__current_session__', updated);
+    setSession(updated);
+  }, [storage, session]);
+  
+  const trackActivity = useCallback((type: string, details?: any) => {
+    if (!session) return;
+    
+    const activity = {
+      timestamp: new Date(),
+      type,
+      details
+    };
+    
+    const updated = {
+      ...session,
+      activities: [...session.activities, activity],
+      lastActiveAt: new Date()
+    };
+    
+    storage.set('__current_session__', updated).then(() => {
+      setSession(updated);
+    });
+  }, [storage, session]);
+  
+  // Load current session on mount
+  useEffect(() => {
+    const loadSession = async () => {
+      const current = await storage.get<Session>('__current_session__');
+      if (current) {
+        setSession(current);
+        setIsActive(true);
+      } else if (options?.autoStart) {
+        startSession();
+      }
+    };
+    
+    loadSession();
+  }, [storage, options?.autoStart]);
+  
+  return {
+    session,
+    isActive,
+    startSession,
+    endSession,
+    updateSession,
+    trackActivity
+  };
+}
+
+/**
+ * Hook for history management
+ */
+export function useHistory(options?: {
+  storage?: AdvancedStorage;
+  limit?: number;
+  types?: HistoryItem['type'][];
+}): {
+  items: HistoryItem[];
+  loading: boolean;
+  addItem: (item: Omit<HistoryItem, 'id' | 'timestamp'>) => Promise<void>;
+  clearHistory: () => Promise<void>;
+  searchHistory: (query: string) => Promise<HistoryItem[]>;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [items, setItems] = useState<HistoryItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  
+  const loadHistory = useCallback(async () => {
+    try {
+      setLoading(true);
+      const keys = await storage.keys();
+      const historyKeys = keys.filter(k => k.startsWith('__history_'));
+      
+      const historyItems: HistoryItem[] = [];
+      for (const key of historyKeys) {
+        const item = await storage.get<HistoryItem>(key);
+        if (item && (!options?.types || options.types.includes(item.type))) {
+          historyItems.push(item);
+        }
+      }
+      
+      // Sort by timestamp descending
+      historyItems.sort((a, b) => 
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      
+      // Apply limit
+      const limited = options?.limit 
+        ? historyItems.slice(0, options.limit)
+        : historyItems;
+      
+      setItems(limited);
+    } catch (error) {
+      console.error('Failed to load history:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [storage, options?.types, options?.limit]);
+  
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+  
+  const addItem = useCallback(async (item: Omit<HistoryItem, 'id' | 'timestamp'>) => {
+    const historyItem: HistoryItem = {
+      ...item,
+      id: `history_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date()
+    };
+    
+    await storage.set(`__history_${historyItem.id}`, historyItem);
+    await loadHistory();
+  }, [storage, loadHistory]);
+  
+  const clearHistory = useCallback(async () => {
+    const keys = await storage.keys();
+    const historyKeys = keys.filter(k => k.startsWith('__history_'));
+    
+    for (const key of historyKeys) {
+      await storage.delete(key);
+    }
+    
+    setItems([]);
+  }, [storage]);
+  
+  const searchHistory = useCallback(async (query: string): Promise<HistoryItem[]> => {
+    const lowerQuery = query.toLowerCase();
+    
+    return items.filter(item => 
+      item.title.toLowerCase().includes(lowerQuery) ||
+      item.description?.toLowerCase().includes(lowerQuery) ||
+      JSON.stringify(item.data).toLowerCase().includes(lowerQuery)
+    );
+  }, [items]);
+  
+  return {
+    items,
+    loading,
+    addItem,
+    clearHistory,
+    searchHistory
+  };
+}
+
+/**
+ * Hook for settings management
+ */
+export function useSettings<T = Settings>(
+  key?: string,
+  options?: {
+    storage?: AdvancedStorage;
+    schema?: any; // Zod schema
+  }
+): {
+  settings: T | null;
+  loading: boolean;
+  update: (updates: Partial<T>) => Promise<void>;
+  reset: () => Promise<void>;
+  subscribe: (callback: (settings: T) => void) => () => void;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const settingsKey = key || '__app_settings__';
+  const [settings, setSettings] = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  
+  const loadSettings = useCallback(async () => {
+    try {
+      setLoading(true);
+      const stored = await storage.get<T>(settingsKey);
+      setSettings(stored);
+    } catch (error) {
+      console.error('Failed to load settings:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [storage, settingsKey]);
+  
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
+  
+  const update = useCallback(async (updates: Partial<T>) => {
+    const current = settings || {} as T;
+    const updated = { ...current, ...updates };
+    
+    // Validate if schema provided
+    if (options?.schema) {
+      try {
+        options.schema.parse(updated);
+      } catch (error) {
+        throw new ValidationError('Settings validation failed', error);
+      }
+    }
+    
+    await storage.set(settingsKey, updated);
+    setSettings(updated);
+  }, [storage, settingsKey, settings, options?.schema]);
+  
+  const reset = useCallback(async () => {
+    await storage.delete(settingsKey);
+    setSettings(null);
+  }, [storage, settingsKey]);
+  
+  const subscribe = useCallback((callback: (settings: T) => void) => {
+    const unsubscribe = storage.watch(settingsKey, (change) => {
+      if (change.newValue) {
+        setSettings(change.newValue as T);
+        callback(change.newValue as T);
+      }
+    });
+    
+    return unsubscribe;
+  }, [storage, settingsKey]);
+  
+  return {
+    settings,
+    loading,
+    update,
+    reset,
+    subscribe
+  };
+}
+
+/**
+ * Hook for optimistic updates
+ */
+export function useOptimisticStorage<T = any>(
+  key: string,
+  defaultValue?: T,
+  options?: {
+    storage?: AdvancedStorage;
+    onError?: (error: Error, rollbackValue: T | undefined) => void;
+  }
+): {
+  value: T | undefined;
+  optimisticValue: T | undefined;
+  update: (value: T) => Promise<void>;
+  isUpdating: boolean;
+  error: Error | null;
+} {
+  const storage = options?.storage || getDefaultStorage();
+  const [value, setValue] = useState<T | undefined>(undefined);
+  const [optimisticValue, setOptimisticValue] = useState<T | undefined>(undefined);
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  
+  // Load initial value
+  useEffect(() => {
+    storage.get<T>(key).then(stored => {
+      const initial = stored !== null ? stored : defaultValue;
+      setValue(initial);
+      setOptimisticValue(initial);
+    });
+  }, [key, storage, defaultValue]);
+  
+  const update = useCallback(async (newValue: T) => {
+    const previousValue = value;
+    
+    try {
+      // Optimistic update
+      setOptimisticValue(newValue);
+      setIsUpdating(true);
+      setError(null);
+      
+      // Actual update
+      await storage.set(key, newValue);
+      setValue(newValue);
+    } catch (err) {
+      // Rollback on error
+      setOptimisticValue(previousValue);
+      setError(err as Error);
+      options?.onError?.(err as Error, previousValue);
+      throw err;
+    } finally {
+      setIsUpdating(false);
+    }
+  }, [key, storage, value, options]);
+  
+  return {
+    value,
+    optimisticValue,
+    update,
+    isUpdating,
+    error
+  };
+}
+
+
+// src/core/storage-manager.ts
+// Storage manager singleton for managing multiple storage instances
+
+import { AdvancedStorage } from './advanced-storage';
+import { StorageConfig, StorageError } from './types';
+
+export interface StorageInstance {
+  name: string;
+  storage: AdvancedStorage;
+  config: StorageConfig;
+  created: Date;
+}
+
+export class StorageManager {
+  private static instance: StorageManager;
+  private storages = new Map<string, StorageInstance>();
+  private defaultStorage?: AdvancedStorage;
+  
+  private constructor() {}
+  
+  /**
+   * Get singleton instance
+   */
+  static getInstance(): StorageManager {
+    if (!StorageManager.instance) {
+      StorageManager.instance = new StorageManager();
+    }
+    return StorageManager.instance;
+  }
+  
+  /**
+   * Create or get storage instance
+   */
+  create(name: string, config?: StorageConfig): AdvancedStorage {
+    // Check if already exists
+    if (this.storages.has(name)) {
+      const existing = this.storages.get(name)!;
+      
+      // If config matches, return existing
+      if (JSON.stringify(existing.config) === JSON.stringify(config)) {
+        return existing.storage;
+      }
+      
+      // Otherwise, throw error
+      throw new StorageError(
+        `Storage instance "${name}" already exists with different configuration`,
+        'STORAGE_EXISTS'
+      );
+    }
+    
+    // Create new instance
+    const storage = new AdvancedStorage(config);
+    const instance: StorageInstance = {
+      name,
+      storage,
+      config: config || {},
+      created: new Date()
+    };
+    
+    this.storages.set(name, instance);
+    
+    // Set as default if first instance
+    if (!this.defaultStorage) {
+      this.defaultStorage = storage;
+    }
+    
+    return storage;
+  }
+  
+  /**
+   * Get storage instance by name
+   */
+  get(name?: string): AdvancedStorage {
+    if (!name) {
+      return this.getDefault();
+    }
+    
+    const instance = this.storages.get(name);
+    if (!instance) {
+      throw new StorageError(
+        `Storage instance "${name}" not found`,
+        'STORAGE_NOT_FOUND'
+      );
+    }
+    
+    return instance.storage;
+  }
+  
+  /**
+   * Get default storage instance
+   */
+  getDefault(): AdvancedStorage {
+    if (!this.defaultStorage) {
+      this.defaultStorage = this.create('default');
+    }
+    return this.defaultStorage;
+  }
+  
+  /**
+   * Check if storage instance exists
+   */
+  has(name: string): boolean {
+    return this.storages.has(name);
+  }
+  
+  /**
+   * List all storage instances
+   */
+  list(): StorageInstance[] {
+    return Array.from(this.storages.values());
+  }
+  
+  /**
+   * Remove storage instance
+   */
+  async remove(name: string): Promise<void> {
+    const instance = this.storages.get(name);
+    if (!instance) {
+      throw new StorageError(
+        `Storage instance "${name}" not found`,
+        'STORAGE_NOT_FOUND'
+      );
+    }
+    
+    // Close storage
+    await instance.storage.close();
+    
+    // Remove from map
+    this.storages.delete(name);
+    
+    // Update default if needed
+    if (this.defaultStorage === instance.storage) {
+      this.defaultStorage = this.storages.size > 0 
+        ? this.storages.values().next().value.storage
+        : undefined;
+    }
+  }
+  
+  /**
+   * Remove all storage instances
+   */
+  async clear(): Promise<void> {
+    // Close all storages
+    for (const instance of this.storages.values()) {
+      await instance.storage.close();
+    }
+    
+    // Clear map
+    this.storages.clear();
+    this.defaultStorage = undefined;
+  }
+  
+  /**
+   * Get storage statistics for all instances
+   */
+  async getAllStats(): Promise<Record<string, any>> {
+    const stats: Record<string, any> = {};
+    
+    for (const [name, instance] of this.storages) {
+      try {
+        stats[name] = await instance.storage.getStats();
+      } catch (error) {
+        stats[name] = { error: error.message };
+      }
+    }
+    
+    return stats;
+  }
+  
+  /**
+   * Set default storage instance
+   */
+  setDefault(name: string): void {
+    const instance = this.storages.get(name);
+    if (!instance) {
+      throw new StorageError(
+        `Storage instance "${name}" not found`,
+        'STORAGE_NOT_FOUND'
+      );
+    }
+    
+    this.defaultStorage = instance.storage;
+  }
+  
+  /**
+   * Create storage with presets
+   */
+  static createWithPreset(
+    preset: 'minimal' | 'standard' | 'advanced' | 'secure',
+    overrides?: Partial<StorageConfig>
+  ): AdvancedStorage {
+    const presets: Record<string, StorageConfig> = {
+      minimal: {
+        cache: { enabled: false },
+        encryption: { enabled: false },
+        compression: { enabled: false },
+        sync: { enabled: false },
+        monitoring: { enabled: false }
+      },
+      standard: {
+        cache: { enabled: true },
+        encryption: { enabled: false },
+        compression: { enabled: true },
+        sync: { enabled: false },
+        monitoring: { enabled: false }
+      },
+      advanced: {
+        cache: { enabled: true },
+        encryption: { enabled: false },
+        compression: { enabled: true },
+        sync: { enabled: true },
+        monitoring: { enabled: true },
+        versioning: { enabled: true }
+      },
+      secure: {
+        cache: { enabled: true },
+        encryption: { enabled: true, algorithm: 'AES-GCM' },
+        compression: { enabled: true },
+        sync: { enabled: true },
+        monitoring: { enabled: true },
+        versioning: { enabled: true }
+      }
+    };
+    
+    const config = { ...presets[preset], ...overrides };
+    return StorageManager.getInstance().create(`${preset}_${Date.now()}`, config);
+  }
+}
+
+// Export singleton instance
+export const storageManager = StorageManager.getInstance();
+
+
+
+// src/services/session-manager.ts
+// Session management service
+
+import { EventEmitter } from 'eventemitter3';
+import { AdvancedStorage } from '../core/advanced-storage';
+import { Session, SessionActivity } from '../core/types';
+
+export interface SessionConfig {
+  maxDuration?: number; // in minutes
+  idleTimeout?: number; // in minutes
+  persistSession?: boolean;
+  trackActivities?: boolean;
+  maxActivities?: number;
+}
+
+export class SessionManager extends EventEmitter {
+  private storage: AdvancedStorage;
+  private config: Required<SessionConfig>;
+  private currentSession: Session | null = null;
+  private activityBuffer: SessionActivity[] = [];
+  private idleTimer?: NodeJS.Timeout;
+  private sessionKey = '__current_session__';
+  
+  constructor(storage: AdvancedStorage, config: SessionConfig = {}) {
+    super();
+    
+    this.storage = storage;
+    this.config = {
+      maxDuration: config.maxDuration || 480, // 8 hours
+      idleTimeout: config.idleTimeout || 30, // 30 minutes
+      persistSession: config.persistSession !== false,
+      trackActivities: config.trackActivities !== false,
+      maxActivities: config.maxActivities || 1000
+    };
+    
+    this.initialize();
+  }
+  
+  private async initialize(): Promise<void> {
+    // Load existing session
+    if (this.config.persistSession) {
+      const stored = await this.storage.get<Session>(this.sessionKey);
+      if (stored && this.isSessionValid(stored)) {
+        this.currentSession = stored;
+        this.startIdleTimer();
+        this.emit('session-resumed', stored);
+      }
+    }
+    
+    // Setup activity listeners
+    this.setupActivityListeners();
+  }
+  
+  private setupActivityListeners(): void {
+    // Track user activity
+    if (typeof document !== 'undefined') {
+      const events = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+      events.forEach(event => {
+        document.addEventListener(event, this.handleUserActivity, { passive: true });
+      });
+      
+      // Track page visibility
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          this.trackActivity('page_view', { action: 'hidden' });
+        } else {
+          this.trackActivity('page_view', { action: 'visible' });
+          this.updateLastActive();
+        }
+      });
+    }
+    
+    // Track Chrome extension navigation if available
+    if (typeof chrome !== 'undefined' && chrome.webNavigation) {
+      chrome.webNavigation.onCompleted.addListener((details) => {
+        if (details.frameId === 0) {
+          this.trackActivity('page_view', {
+            url: details.url,
+            tabId: details.tabId
+          });
+        }
+      });
+    }
+  }
+  
+  private handleUserActivity = (): void => {
+    this.updateLastActive();
+    this.resetIdleTimer();
+  }
+  
+  private startIdleTimer(): void {
+    this.resetIdleTimer();
+  }
+  
+  private resetIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+    }
+    
+    if (this.config.idleTimeout && this.currentSession) {
+      this.idleTimer = setTimeout(() => {
+        this.handleIdleTimeout();
+      }, this.config.idleTimeout * 60 * 1000);
+    }
+  }
+  
+  private handleIdleTimeout(): void {
+    if (this.currentSession) {
+      this.trackActivity('action', { type: 'idle_timeout' });
+      this.endSession('idle_timeout');
+    }
+  }
+  
+  async startSession(userId?: string, data?: Record<string, any>): Promise<Session> {
+    // End current session if exists
+    if (this.currentSession) {
+      await this.endSession('new_session');
+    }
+    
+    const now = new Date();
+    const session: Session = {
+      id: `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      userId,
+      startedAt: now,
+      lastActiveAt: now,
+      expiresAt: this.config.maxDuration
+        ? new Date(now.getTime() + this.config.maxDuration * 60 * 1000)
+        : undefined,
+      data: data || {},
+      device: this.getDeviceInfo(),
+      activities: []
+    };
+    
+    this.currentSession = session;
+    await this.saveSession();
+    
+    this.startIdleTimer();
+    this.trackActivity('action', { type: 'session_start' });
+    
+    this.emit('session-started', session);
+    
+    return session;
+  }
+  
+  async endSession(reason = 'manual'): Promise<void> {
+    if (!this.currentSession) return;
+    
+    this.trackActivity('action', { type: 'session_end', reason });
+    
+    // Flush activity buffer
+    await this.flushActivities();
+    
+    // Save final state
+    await this.saveSession();
+    
+    // Archive session
+    await this.archiveSession(this.currentSession);
+    
+    // Clear current session
+    const endedSession = this.currentSession;
+    this.currentSession = null;
+    await this.storage.delete(this.sessionKey);
+    
+    // Clear timers
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    
+    this.emit('session-ended', { session: endedSession, reason });
+  }
+  
+  async updateSession(data: Partial<Session['data']>): Promise<void> {
+    if (!this.currentSession) {
+      throw new Error('No active session');
+    }
+    
+    this.currentSession.data = {
+      ...this.currentSession.data,
+      ...data
+    };
+    
+    await this.saveSession();
+  }
+  
+  trackActivity(type: SessionActivity['type'], details: Record<string, any> = {}): void {
+    if (!this.currentSession || !this.config.trackActivities) return;
+    
+    const activity: SessionActivity = {
+      timestamp: new Date(),
+      type,
+      details
+    };
+    
+    this.activityBuffer.push(activity);
+    
+    // Batch save activities
+    if (this.activityBuffer.length >= 10) {
+      this.flushActivities();
+    }
+  }
+  
+  private async flushActivities(): Promise<void> {
+    if (!this.currentSession || this.activityBuffer.length === 0) return;
+    
+    this.currentSession.activities.push(...this.activityBuffer);
+    
+    // Limit activities
+    if (this.config.maxActivities && this.currentSession.activities.length > this.config.maxActivities) {
+      this.currentSession.activities = this.currentSession.activities.slice(-this.config.maxActivities);
+    }
+    
+    this.activityBuffer = [];
+    await this.saveSession();
+  }
+  
+  private async saveSession(): Promise<void> {
+    if (!this.currentSession || !this.config.persistSession) return;
+    
+    await this.storage.set(this.sessionKey, this.currentSession);
+  }
+  
+  private async archiveSession(session: Session): Promise<void> {
+    const archiveKey = `__session_archive_${session.id}`;
+    await this.storage.set(archiveKey, session, { tags: ['session', 'archive'] });
+  }
+  
+  private updateLastActive(): void {
+    if (!this.currentSession) return;
+    
+    this.currentSession.lastActiveAt = new Date();
+    this.saveSession();
+  }
+  
+  private isSessionValid(session: Session): boolean {
+    const now = new Date();
+    
+    // Check expiration
+    if (session.expiresAt && now > new Date(session.expiresAt)) {
+      return false;
+    }
+    
+    // Check idle timeout
+    if (this.config.idleTimeout) {
+      const idleTime = now.getTime() - new Date(session.lastActiveAt).getTime();
+      if (idleTime > this.config.idleTimeout * 60 * 1000) {
+        return false;
+      }
+    }
+    
+    return true;
+  }
+  
+  private getDeviceInfo(): Session['device'] {
+    if (typeof navigator === 'undefined') {
+      return undefined;
+    }
+    
+    return {
+      browser: navigator.userAgent,
+      os: navigator.platform,
+      screen: typeof screen !== 'undefined' ? `${screen.width}x${screen.height}` : 'unknown'
+    };
+  }
+  
+  // Public methods
+  
+  getCurrentSession(): Session | null {
+    return this.currentSession;
+  }
+  
+  isActive(): boolean {
+    return this.currentSession !== null && this.isSessionValid(this.currentSession);
+  }
+  
+  async getSessionHistory(userId?: string, limit = 10): Promise<Session[]> {
+    const keys = await this.storage.keys();
+    const archiveKeys = keys.filter(k => k.startsWith('__session_archive_'));
+    
+    const sessions: Session[] = [];
+    for (const key of archiveKeys) {
+      const session = await this.storage.get<Session>(key);
+      if (session && (!userId || session.userId === userId)) {
+        sessions.push(session);
+      }
+    }
+    
+    // Sort by start time descending
+    sessions.sort((a, b) => 
+      new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    );
+    
+    return sessions.slice(0, limit);
+  }
+  
+  async getSessionById(sessionId: string): Promise<Session | null> {
+    return this.storage.get(`__session_archive_${sessionId}`);
+  }
+  
+  async clearOldSessions(daysToKeep = 30): Promise<number> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
+    
+    const keys = await this.storage.keys();
+    const archiveKeys = keys.filter(k => k.startsWith('__session_archive_'));
+    
+    let deletedCount = 0;
+    
+    for (const key of archiveKeys) {
+      const session = await this.storage.get<Session>(key);
+      if (session && new Date(session.startedAt) < cutoffDate) {
+        await this.storage.delete(key);
+        deletedCount++;
+      }
+    }
+    
+    return deletedCount;
+  }
+  
+  destroy(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+    }
+    
+    if (typeof document !== 'undefined') {
+      const events = ['mousedown', 'keydown', 'scroll', 'touchstart'];
+      events.forEach(event => {
+        document.removeEventListener(event, this.handleUserActivity);
+      });
+    }
+    
+    this.removeAllListeners();
+  }
+}
+
+
+// src/services/history-manager.ts
+// History tracking and management service
+
+import { EventEmitter } from 'eventemitter3';
+import { z } from 'zod';
+import { AdvancedStorage } from '../core/advanced-storage';
+import { HistoryItem } from '../core/types';
+
+export const HistoryItemSchema = z.object({
+  id: z.string(),
+  timestamp: z.date(),
+  type: z.enum(['analysis', 'fact_check', 'search', 'action', 'view', 'custom']),
+  title: z.string(),
+  description: z.string().optional(),
+  url: z.string().optional(),
+  data: z.record(z.any()),
+  metadata: z.object({
+    duration: z.number().optional(),
+    status: z.enum(['success', 'failure', 'pending']).optional(),
+    tags: z.array(z.string()).optional(),
+    source: z.string().optional()
+  }).optional(),
+  groupId: z.string().optional()
+});
+
+export interface HistoryGroup {
+  id: string;
+  title: string;
+  date: Date;
+  items: HistoryItem[];
+  collapsed?: boolean;
+}
+
+export interface HistoryFilters {
+  types?: HistoryItem['type'][];
+  dateRange?: {
+    start: Date;
+    end: Date;
+  };
+  search?: string;
+  tags?: string[];
+  status?: string[];
+}
+
+export interface HistoryStats {
+  totalItems: number;
+  itemsByType: Record<string, number>;
+  itemsByDay: Array<{ date: string; count: number }>;
+  recentActivity: HistoryItem[];
+  topTags: Array<{ tag: string; count: number }>;
+}
+
+export class HistoryManager extends EventEmitter {
+  private storage: AdvancedStorage;
+  private historyKey = 'history_items';
+  private maxItems: number;
+  private groupByTime: boolean;
+  
+  constructor(
+    storage: AdvancedStorage,
+    options: { maxItems?: number; groupByTime?: boolean } = {}
+  ) {
+    super();
+    
+    this.storage = storage;
+    this.maxItems = options.maxItems || 10000;
+    this.groupByTime = options.groupByTime !== false;
+  }
+  
+  async addItem(item: Omit<HistoryItem, 'id' | 'timestamp'>): Promise<HistoryItem> {
+    // Validate input
+    const validatedItem = HistoryItemSchema.parse({
+      ...item,
+      id: `history_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date()
+    });
+    
+    // Store item
+    await this.storage.set(
+      `${this.historyKey}_${validatedItem.id}`,
+      validatedItem,
+      { tags: ['history', validatedItem.type] }
+    );
+    
+    // Cleanup old items
+    await this.cleanupOldItems();
+    
+    // Dispatch event
+    this.emit('history-item-added', validatedItem);
+    
+    return validatedItem;
+  }
+  
+  async getItems(filters?: HistoryFilters, limit = 50): Promise<HistoryItem[]> {
+    const query: any = {
+      where: {},
+      orderBy: [['timestamp', 'desc']],
+      limit
+    };
+    
+    // Build where clause
+    const whereClauses: any = {};
+    
+    if (filters?.types && filters.types.length > 0) {
+      whereClauses.type = { $in: filters.types };
+    }
+    
+    if (filters?.dateRange) {
+      whereClauses.timestamp = {
+        $gte: filters.dateRange.start,
+        $lte: filters.dateRange.end
+      };
+    }
+    
+    if (filters?.tags && filters.tags.length > 0) {
+      whereClauses['metadata.tags'] = { $all: filters.tags };
+    }
+    
+    if (filters?.status && filters.status.length > 0) {
+      whereClauses['metadata.status'] = { $in: filters.status };
+    }
+    
+    // Get all history items
+    const keys = await this.storage.keys();
+    const historyKeys = keys.filter(k => k.startsWith(`${this.historyKey}_`));
+    
+    const items: HistoryItem[] = [];
+    for (const key of historyKeys) {
+      const item = await this.storage.get<HistoryItem>(key);
+      if (item && this.matchesFilters(item, whereClauses)) {
+        items.push(item);
+      }
+    }
+    
+    // Sort items
+    items.sort((a, b) => 
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+    
+    // Apply text search if needed
+    let filteredItems = items;
+    if (filters?.search) {
+      const searchLower = filters.search.toLowerCase();
+      filteredItems = items.filter(item =>
+        item.title.toLowerCase().includes(searchLower) ||
+        item.description?.toLowerCase().includes(searchLower) ||
+        JSON.stringify(item.data).toLowerCase().includes(searchLower)
+      );
+    }
+    
+    return filteredItems.slice(0, limit);
+  }
+  
+  async getTimeline(days = 7, filters?: HistoryFilters): Promise<HistoryGroup[]> {
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+    
+    const items = await this.getItems({
+      ...filters,
+      dateRange: { start: startDate, end: endDate }
+    }, 1000);
+    
+    // Group by day
+    const groups = new Map<string, HistoryItem[]>();
+    
+    items.forEach(item => {
+      const date = new Date(item.timestamp);
+      const dateKey = date.toISOString().split('T')[0];
+      
+      if (!groups.has(dateKey)) {
+        groups.set(dateKey, []);
+      }
+      groups.get(dateKey)!.push(item);
+    });
+    
+    // Convert to HistoryGroup array
+    return Array.from(groups.entries())
+      .map(([dateStr, items]) => ({
+        id: `group_${dateStr}`,
+        title: this.formatGroupTitle(new Date(dateStr)),
+        date: new Date(dateStr),
+        items: items.sort((a, b) =>
+          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+        )
+      }))
+      .sort((a, b) => b.date.getTime() - a.date.getTime());
+  }
+  
+  async getStats(days = 30): Promise<HistoryStats> {
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+    
+    const items = await this.getItems({
+      dateRange: { start: startDate, end: endDate }
+    }, 10000);
+    
+    // Calculate stats
+    const itemsByType: Record<string, number> = {};
+    const itemsByDay = new Map<string, number>();
+    const tagCounts = new Map<string, number>();
+    
+    items.forEach(item => {
+      // By type
+      itemsByType[item.type] = (itemsByType[item.type] || 0) + 1;
+      
+      // By day
+      const dateKey = new Date(item.timestamp).toISOString().split('T')[0];
+      itemsByDay.set(dateKey, (itemsByDay.get(dateKey) || 0) + 1);
+      
+      // Tags
+      item.metadata?.tags?.forEach(tag => {
+        tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+      });
+    });
+    
+    // Fill missing days
+    const dayArray: Array<{ date: string; count: number }> = [];
+    for (let i = 0; i < days; i++) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const dateKey = date.toISOString().split('T')[0];
+      dayArray.push({
+        date: dateKey,
+        count: itemsByDay.get(dateKey) || 0
+      });
+    }
+    
+    // Top tags
+    const topTags = Array.from(tagCounts.entries())
+      .map(([tag, count]) => ({ tag, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+    
+    return {
+      totalItems: items.length,
+      itemsByType,
+      itemsByDay: dayArray.reverse(),
+      recentActivity: items.slice(0, 10),
+      topTags
+    };
+  }
+  
+  async searchHistory(query: string, limit = 50): Promise<HistoryItem[]> {
+    return this.getItems({ search: query }, limit);
+  }
+  
+  async getRelatedItems(itemId: string, limit = 10): Promise<HistoryItem[]> {
+    const item = await this.storage.get<HistoryItem>(`${this.historyKey}_${itemId}`);
+    if (!item) return [];
+    
+    // Find items with similar tags or from same group
+    const allItems = await this.getItems({}, 1000);
+    
+    const relatedItems = allItems.filter(i => {
+      if (i.id === itemId) return false;
+      
+      // Same group
+      if (item.groupId && i.groupId === item.groupId) return true;
+      
+      // Similar tags
+      if (item.metadata?.tags && i.metadata?.tags) {
+        const sharedTags = item.metadata.tags.filter(tag => 
+          i.metadata!.tags!.includes(tag)
+        );
+        return sharedTags.length > 0;
+      }
+      
+      return false;
+    });
+    
+    return relatedItems.slice(0, limit);
+  }
+  
+  async updateItem(
+    itemId: string,
+    updates: Partial<Omit<HistoryItem, 'id' | 'timestamp'>>
+  ): Promise<void> {
+    const key = `${this.historyKey}_${itemId}`;
+    const item = await this.storage.get<HistoryItem>(key);
+    
+    if (!item) {
+      throw new Error(`History item ${itemId} not found`);
+    }
+    
+    const updated = {
+      ...item,
+      ...updates,
+      metadata: {
+        ...item.metadata,
+        ...updates.metadata
+      }
+    };
+    
+    await this.storage.set(key, updated);
+  }
+  
+  async deleteItem(itemId: string): Promise<void> {
+    await this.storage.delete(`${this.historyKey}_${itemId}`);
+  }
+  
+  async clearHistory(filters?: HistoryFilters): Promise<number> {
+    const items = await this.getItems(filters, 100000);
+    
+    for (const item of items) {
+      await this.deleteItem(item.id);
+    }
+    
+    return items.length;
+  }
+  
+  async exportHistory(filters?: HistoryFilters): Promise<Blob> {
+    const items = await this.getItems(filters, 100000);
+    
+    const exportData = {
+      exportDate: new Date().toISOString(),
+      version: '1.0',
+      itemCount: items.length,
+      items
+    };
+    
+    return new Blob(
+      [JSON.stringify(exportData, null, 2)],
+      { type: 'application/json' }
+    );
+  }
+  
+  async importHistory(file: Blob): Promise<number> {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    
+    if (!data.items || !Array.isArray(data.items)) {
+      throw new Error('Invalid history export file');
+    }
+    
+    let imported = 0;
+    for (const item of data.items) {
+      try {
+        // Validate and import
+        const validated = HistoryItemSchema.parse({
+          ...item,
+          timestamp: new Date(item.timestamp)
+        });
+        
+        await this.storage.set(
+          `${this.historyKey}_${validated.id}`,
+          validated,
+          { tags: ['history', validated.type, 'imported'] }
+        );
+        
+        imported++;
+      } catch (error) {
+        console.error('Failed to import history item:', error);
+      }
+    }
+    
+    return imported;
+  }
+  
+  private async cleanupOldItems(): Promise<void> {
+    const items = await this.getItems({}, 100000);
+    
+    if (items.length > this.maxItems) {
+      const toDelete = items.slice(this.maxItems);
+      for (const item of toDelete) {
+        await this.deleteItem(item.id);
+      }
+    }
+  }
+  
+  private formatGroupTitle(date: Date): string {
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    if (date.toDateString() === today.toDateString()) {
+      return 'Today';
+    } else if (date.toDateString() === yesterday.toDateString()) {
+      return 'Yesterday';
+    } else {
+      return date.toLocaleDateString('en-US', {
+        weekday: 'long',
+        month: 'long',
+        day: 'numeric'
+      });
+    }
+  }
+  
+  private matchesFilters(item: HistoryItem, filters: any): boolean {
+    for (const [key, condition of Object.entries(filters)) {
+      const value = this.getNestedValue(item, key);
+      
+      if (!this.matchesCondition(value, condition)) {
+        return false;
+      }
+    }
+    
+    return true;
+  }
+  
+  private getNestedValue(obj: any, path: string): any {
+    return path.split('.').reduce((curr, key) => curr?.[key], obj);
+  }
+  
+  private matchesCondition(value: any, condition: any): boolean {
+    if (typeof condition === 'object' && condition !== null) {
+      if ('$in' in condition) {
+        return Array.isArray(condition.$in) && condition.$in.includes(value);
+      }
+      if ('$gte' in condition && '$lte' in condition) {
+        return value >= condition.$gte && value <= condition.$lte;
+      }
+      if ('$all' in condition && Array.isArray(value)) {
+        return condition.$all.every((item: any) => value.includes(item));
+      }
+    }
+    
+    return value === condition;
+  }
+}
+
+
+// src/services/settings-store.ts
+// Settings management with schema validation
+
+import { EventEmitter } from 'eventemitter3';
+import { z } from 'zod';
+import { AdvancedStorage } from '../core/advanced-storage';
+import { Settings } from '../core/types';
+
+// Define settings schemas
+export const ThemeSchema = z.enum(['light', 'dark', 'system', 'auto']);
+
+export const NotificationSettingsSchema = z.object({
+  enabled: z.boolean(),
+  sound: z.boolean(),
+  desktop: z.boolean(),
+  types: z.object({
+    info: z.boolean(),
+    warning: z.boolean(),
+    error: z.boolean(),
+    success: z.boolean()
+  })
+});
+
+export const PrivacySettingsSchema = z.object({
+  trackingEnabled: z.boolean(),
+  shareAnalytics: z.boolean(),
+  storageEncryption: z.boolean(),
+  clearDataOnUninstall: z.boolean()
+});
+
+export const AppearanceSettingsSchema = z.object({
+  theme: ThemeSchema,
+  fontSize: z.enum(['small', 'medium', 'large']),
+  compactMode: z.boolean(),
+  animations: z.boolean(),
+  highContrast: z.boolean()
+});
+
+export const SettingsSchema = z.object({
+  version: z.string(),
+  appearance: AppearanceSettingsSchema,
+  notifications: NotificationSettingsSchema,
+  privacy: PrivacySettingsSchema,
+  features: z.record(z.boolean()),
+  shortcuts: z.record(z.string()),
+  advanced: z.record(z.any())
+});
+
+export type SettingsType = z.infer<typeof SettingsSchema>;
+export type SettingsKey = keyof SettingsType;
+export type DeepPartial<T> = T extends object ? { [P in keyof T]?: DeepPartial<T[P]> } : T;
+
+export interface SettingsChangeEvent {
+  key: string;
+  oldValue: any;
+  newValue: any;
+  timestamp: Date;
+}
+
+export class SettingsStore extends EventEmitter {
+  private storage: AdvancedStorage;
+  private cache: SettingsType | null = null;
+  private settingsKey = '__app_settings__';
+  private defaultSettings: SettingsType;
+  
+  constructor(storage: AdvancedStorage) {
+    super();
+    
+    this.storage = storage;
+    this.defaultSettings = this.getDefaultSettings();
+    this.initialize();
+  }
+  
+  private async initialize(): Promise<void> {
+    await this.load();
+    
+    // Listen for storage changes
+    this.storage.watch(this.settingsKey, (change) => {
+      if (change.newValue) {
+        this.cache = change.newValue as SettingsType;
+        this.notifyListeners('*', null, change.newValue);
+      }
+    });
+  }
+  
+  private getDefaultSettings(): SettingsType {
+    return {
+      version: '1.0.0',
+      appearance: {
+        theme: 'system',
+        fontSize: 'medium',
+        compactMode: false,
+        animations: true,
+        highContrast: false
+      },
+      notifications: {
+        enabled: true,
+        sound: true,
+        desktop: true,
+        types: {
+          info: true,
+          warning: true,
+          error: true,
+          success: true
+        }
+      },
+      privacy: {
+        trackingEnabled: true,
+        shareAnalytics: false,
+        storageEncryption: false,
+        clearDataOnUninstall: false
+      },
+      features: {},
+      shortcuts: {
+        'toggle-extension': 'Ctrl+Shift+E',
+        'open-settings': 'Ctrl+,',
+        'quick-search': 'Ctrl+K'
+      },
+      advanced: {}
+    };
+  }
+  
+  async load(): Promise<SettingsType> {
+    try {
+      const stored = await this.storage.get<SettingsType>(this.settingsKey);
+      
+      if (stored) {
+        // Validate and merge with defaults
+        const validated = SettingsSchema.parse({
+          ...this.defaultSettings,
+          ...stored
+        });
+        this.cache = validated;
+      } else {
+        // First time - use defaults
+        this.cache = this.defaultSettings;
+        await this.save();
+      }
+      
+      return this.cache;
+    } catch (error) {
+      console.error('Failed to load settings:', error);
+      this.cache = this.defaultSettings;
+      return this.cache;
+    }
+  }
+  
+  async save(): Promise<void> {
+    if (!this.cache) return;
+    
+    try {
+      await this.storage.set(this.settingsKey, this.cache, { tags: ['settings'] });
+    } catch (error) {
+      console.error('Failed to save settings:', error);
+      throw error;
+    }
+  }
+  
+  get<K extends SettingsKey>(key: K): SettingsType[K];
+  get<K extends string>(key: K): any;
+  get(key: string): any {
+    if (!this.cache) {
+      throw new Error('Settings not loaded');
+    }
+    
+    // Support nested keys like 'appearance.theme'
+    return key.split('.').reduce((obj, k) => obj?.[k], this.cache as any);
+  }
+  
+  async set<K extends SettingsKey>(key: K, value: SettingsType[K]): Promise<void>;
+  async set(key: string, value: any): Promise<void>;
+  async set(key: string, value: any): Promise<void> {
+    if (!this.cache) {
+      await this.load();
+    }
+    
+    const oldValue = this.get(key);
+    
+    // Set nested value
+    const keys = key.split('.');
+    const lastKey = keys.pop()!;
+    const target = keys.reduce((obj, k) => {
+      if (!obj[k]) obj[k] = {};
+      return obj[k];
+    }, this.cache as any);
+    
+    target[lastKey] = value;
+    
+    // Validate entire settings
+    try {
+      this.cache = SettingsSchema.parse(this.cache);
+    } catch (error) {
+      // Rollback
+      target[lastKey] = oldValue;
+      throw new Error(`Invalid settings value: ${error}`);
+    }
+    
+    // Save to storage
+    await this.save();
+    
+    // Notify listeners
+    this.notifyListeners(key, oldValue, value);
+  }
+  
+  async update(updates: DeepPartial<SettingsType>): Promise<void> {
+    if (!this.cache) {
+      await this.load();
+    }
+    
+    const oldSettings = { ...this.cache };
+    
+    // Deep merge
+    this.cache = this.deepMerge(this.cache!, updates) as SettingsType;
+    
+    // Validate
+    try {
+      this.cache = SettingsSchema.parse(this.cache);
+    } catch (error) {
+      // Rollback
+      this.cache = oldSettings;
+      throw new Error(`Invalid settings update: ${error}`);
+    }
+    
+    // Save
+    await this.save();
+    
+    // Notify about all changes
+    this.findChanges(oldSettings, this.cache).forEach(({ key, oldValue, newValue }) => {
+      this.notifyListeners(key, oldValue, newValue);
+    });
+  }
+  
+  async reset(key?: string): Promise<void> {
+    if (!key) {
+      // Reset all settings
+      const oldSettings = { ...this.cache };
+      this.cache = this.defaultSettings;
+      await this.save();
+      
+      // Notify about all changes
+      this.findChanges(oldSettings, this.cache).forEach(({ key, oldValue, newValue }) => {
+        this.notifyListeners(key, oldValue, newValue);
+      });
+    } else {
+      // Reset specific key
+      const defaultValue = this.getDefaultValue(key);
+      await this.set(key, defaultValue);
+    }
+  }
+  
+  subscribe(key: string, callback: (event: SettingsChangeEvent) => void): () => void {
+    const listener = (event: SettingsChangeEvent) => {
+      if (key === '*' || event.key === key || event.key.startsWith(`${key}.`)) {
+        callback(event);
+      }
+    };
+    
+    this.on('change', listener);
+    
+    // Return unsubscribe function
+    return () => {
+      this.off('change', listener);
+    };
+  }
+  
+  async export(): Promise<string> {
+    if (!this.cache) {
+      await this.load();
+    }
+    
+    return JSON.stringify(this.cache, null, 2);
+  }
+  
+  async import(settingsJson: string): Promise<void> {
+    try {
+      const imported = JSON.parse(settingsJson);
+      const validated = SettingsSchema.parse(imported);
+      
+      const oldSettings = { ...this.cache };
+      this.cache = validated;
+      await this.save();
+      
+      // Notify about changes
+      this.findChanges(oldSettings, this.cache).forEach(({ key, oldValue, newValue }) => {
+        this.notifyListeners(key, oldValue, newValue);
+      });
+    } catch (error) {
+      throw new Error(`Invalid settings import: ${error}`);
+    }
+  }
+  
+  getSchema(): typeof SettingsSchema {
+    return SettingsSchema;
+  }
+  
+  validate(settings: any): SettingsType {
+    return SettingsSchema.parse(settings);
+  }
+  
+  private notifyListeners(key: string, oldValue: any, newValue: any): void {
+    const event: SettingsChangeEvent = {
+      key,
+      oldValue,
+      newValue,
+      timestamp: new Date()
+    };
+    
+    this.emit('change', event);
+  }
+  
+  private deepMerge(target: any, source: any): any {
+    const output = { ...target };
+    
+    Object.keys(source).forEach(key => {
+      if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+        if (key in target) {
+          output[key] = this.deepMerge(target[key], source[key]);
+        } else {
+          output[key] = source[key];
+        }
+      } else {
+        output[key] = source[key];
+      }
+    });
+    
+    return output;
+  }
+  
+  private findChanges(
+    oldObj: any,
+    newObj: any,
+    path = ''
+  ): Array<{ key: string; oldValue: any; newValue: any }> {
+    const changes: Array<{ key: string; oldValue: any; newValue: any }> = [];
+    
+    Object.keys(newObj).forEach(key => {
+      const fullKey = path ? `${path}.${key}` : key;
+      const oldValue = oldObj?.[key];
+      const newValue = newObj[key];
+      
+      if (typeof newValue === 'object' && newValue !== null && !Array.isArray(newValue)) {
+        changes.push(...this.findChanges(oldValue || {}, newValue, fullKey));
+      } else if (oldValue !== newValue) {
+        changes.push({ key: fullKey, oldValue, newValue });
+      }
+    });
+    
+    return changes;
+  }
+  
+  private getDefaultValue(key: string): any {
+    return key.split('.').reduce((obj, k) => obj?.[k], this.defaultSettings as any);
+  }
+  
+  destroy(): void {
+    this.removeAllListeners();
+  }
+}
+
+
+// src/index.ts
+// Main entry point for @chrome-storage/core package
+
+// Core exports
+export { AdvancedStorage } from './core/advanced-storage';
+export { StorageManager, storageManager } from './core/storage-manager';
+export * from './core/types';
+
+// Adapter exports
+export { BaseAdapter } from './adapters/base-adapter';
+export { ChromeAdapter } from './adapters/chrome-adapter';
+export { IndexedDBAdapter } from './adapters/indexeddb-adapter';
+export { MemoryAdapter, memoryAdapter } from './adapters/memory-adapter';
+
+// Service exports
+export { SessionManager } from './services/session-manager';
+export { HistoryManager } from './services/history-manager';
+export { SettingsStore } from './services/settings-store';
+
+// Cache exports
+export { StorageCache } from './cache/storage-cache';
+
+// Security exports
+export { EncryptionService } from './security/encryption-service';
+
+// Compression exports
+export { CompressionService } from './compression/compression-service';
+
+// Sync exports
+export { SyncManager } from './sync/sync-manager';
+
+// Query exports
+export { QueryEngine } from './query/query-engine';
+
+// Monitoring exports
+export { MetricsCollector } from './monitoring/metrics-collector';
+
+// Validation exports
+export { SchemaValidator } from './validation/schema-validator';
+
+// React exports (only if React is available)
+export * from './react/hooks';
+
+// Convenience exports for common use cases
+import { storageManager } from './core/storage-manager';
+import { AdvancedStorage } from './core/advanced-storage';
+import { SessionManager } from './services/session-manager';
+import { HistoryManager } from './services/history-manager';
+import { SettingsStore } from './services/settings-store';
+
+/**
+ * Get or create default storage instance
+ */
+export function getStorage(name?: string): AdvancedStorage {
+  return name ? storageManager.get(name) : storageManager.getDefault();
+}
+
+/**
+ * Create storage with preset configuration
+ */
+export function createStorage(
+  preset: 'minimal' | 'standard' | 'advanced' | 'secure',
+  overrides?: any
+): AdvancedStorage {
+  return StorageManager.createWithPreset(preset, overrides);
+}
+
+/**
+ * Create session manager for default storage
+ */
+export function createSessionManager(options?: any): SessionManager {
+  return new SessionManager(storageManager.getDefault(), options);
+}
+
+/**
+ * Create history manager for default storage
+ */
+export function createHistoryManager(options?: any): HistoryManager {
+  return new HistoryManager(storageManager.getDefault(), options);
+}
+
+/**
+ * Create settings store for default storage
+ */
+export function createSettingsStore(): SettingsStore {
+  return new SettingsStore(storageManager.getDefault());
+}
+
+// Default export
+export default {
+  getStorage,
+  createStorage,
+  createSessionManager,
+  createHistoryManager,
+  createSettingsStore,
+  storageManager
+};
+
+
+
