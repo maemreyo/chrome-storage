@@ -387,7 +387,7 @@ export class HistoryManager extends EventEmitter {
   }
   
   private matchesFilters(item: HistoryItem, filters: any): boolean {
-    for (const [key, condition of Object.entries(filters)) {
+    for (const [key, condition] of Object.entries(filters)) {
       const value = this.getNestedValue(item, key);
       
       if (!this.matchesCondition(value, condition)) {
