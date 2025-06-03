@@ -1,4 +1,4 @@
-# @chrome-storage/core
+# @matthew.ngo/chrome-storage
 
 Advanced storage solution for Chrome extensions with encryption, compression, sync, and enterprise features.
 
@@ -18,17 +18,17 @@ Advanced storage solution for Chrome extensions with encryption, compression, sy
 ## Installation
 
 ```bash
-npm install @chrome-storage/core
+npm install @matthew.ngo/chrome-storage
 # or
-yarn add @chrome-storage/core
+yarn add @matthew.ngo/chrome-storage
 # or
-pnpm add @chrome-storage/core
+pnpm add @matthew.ngo/chrome-storage
 ```
 
 ## Quick Start
 
 ```typescript
-import { getStorage } from '@chrome-storage/core';
+import { getStorage } from '@matthew.ngo/chrome-storage';
 
 // Get default storage instance
 const storage = getStorage();
@@ -53,13 +53,13 @@ await storage.delete('user');
 The library supports multiple storage backends with automatic selection:
 
 ```typescript
-import { createStorage } from '@chrome-storage/core';
+import { createStorage } from '@matthew.ngo/chrome-storage';
 
 // Auto-detect best adapter
 const storage = createStorage('standard');
 
 // Use specific adapter
-import { ChromeAdapter, IndexedDBAdapter } from '@chrome-storage/core';
+import { ChromeAdapter, IndexedDBAdapter } from '@matthew.ngo/chrome-storage';
 
 const chromeStorage = new AdvancedStorage({
   adapter: 'chrome'
@@ -91,7 +91,7 @@ const secure = createStorage('secure');
 ### Custom Configuration
 
 ```typescript
-import { AdvancedStorage } from '@chrome-storage/core';
+import { AdvancedStorage } from '@matthew.ngo/chrome-storage';
 
 const storage = new AdvancedStorage({
   adapter: 'auto',
@@ -192,7 +192,7 @@ const users = await storage.sql(
 ### Session Management
 
 ```typescript
-import { createSessionManager } from '@chrome-storage/core';
+import { createSessionManager } from '@matthew.ngo/chrome-storage';
 
 const sessions = createSessionManager({
   maxDuration: 480, // 8 hours
@@ -222,7 +222,7 @@ await sessions.endSession('logout');
 ### History Management
 
 ```typescript
-import { createHistoryManager } from '@chrome-storage/core';
+import { createHistoryManager } from '@matthew.ngo/chrome-storage';
 
 const history = createHistoryManager({
   maxItems: 10000,
@@ -265,7 +265,7 @@ const blob = await history.exportHistory();
 ### Settings Management
 
 ```typescript
-import { createSettingsStore } from '@chrome-storage/core';
+import { createSettingsStore } from '@matthew.ngo/chrome-storage';
 
 const settings = createSettingsStore();
 
@@ -306,7 +306,7 @@ import {
   useSession,
   useHistory,
   useSettings
-} from '@chrome-storage/core';
+} from '@matthew.ngo/chrome-storage';
 
 function MyComponent() {
   // Basic storage hook

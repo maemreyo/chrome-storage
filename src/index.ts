@@ -1,4 +1,4 @@
-// Main entry point for @chrome-storage/core package
+// Main entry point for @matthew.ngo/chrome-storage package
 
 // Core exports
 export { AdvancedStorage } from './core/advanced-storage';
