@@ -1,5 +1,5 @@
 {
-  "name": "@chrome-storage/core",
+  "name": "@matthew.ngo/chrome-storage",
   "version": "1.0.0",
   "description": "Advanced storage solution for Chrome extensions with encryption, compression, sync, and enterprise features",
   "main": "dist/index.js",
